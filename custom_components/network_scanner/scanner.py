@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import re
 import socket
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import nmap
@@ -16,12 +17,23 @@ _LOGGER = logging.getLogger(__name__)
 
 # nmap args:
 #   -sn                : ping scan only, no port scan
-#   -n                 : skip DNS (we do fast reverse-DNS ourselves, only for live IPs)
+#   -n                 : skip DNS (we do our own reverse-DNS, in parallel, only
+#                        for hosts that actually answered)
 #   -T4                : aggressive timing template
 #   --min-parallelism  : probe many hosts at once
+#   --min-rate         : floor on probes/sec, so a quiet subnet finishes fast
 #   --max-retries 1    : don't linger on unresponsive hosts
-#   --host-timeout 3s  : give up on any single host after 3s
-NMAP_ARGS = "-sn -n -T4 --min-parallelism 64 --max-retries 1 --host-timeout 3s"
+#
+# Note: --host-timeout is deliberately absent. With -sn there is no port scan,
+# so an unreachable host is decided in milliseconds and the ceiling almost never
+# binds; when it does bind it drops slow-but-live hosts, which combined with
+# --max-retries 1 made the device count flap between scans.
+NMAP_ARGS = "-sn -n -T4 --min-parallelism 128 --min-rate 500 --max-retries 1"
+
+# Reverse-DNS is done concurrently across discovered hosts. Serially, a 0.3s
+# timeout per host meant ~12s of pure DNS wait on a /24 with 40 nameless devices.
+RDNS_TIMEOUT = 0.3
+RDNS_MAX_WORKERS = 32
 
 
 class NetworkScannerClient:
@@ -53,15 +65,35 @@ class NetworkScannerClient:
         return short or None
 
     @staticmethod
-    def _fast_rdns(ip: str, timeout: float = 0.3) -> str | None:
-        """Reverse-DNS with a very short timeout; returns cleaned short label or None."""
-        old_to = socket.getdefaulttimeout()
-        socket.setdefaulttimeout(timeout)
+    def _fast_rdns(ip: str) -> str | None:
+        """Reverse-DNS for one IP; returns a cleaned short label or None.
+
+        Called from several worker threads at once, so it must not touch
+        socket.setdefaulttimeout() - that is process-global state and racing
+        workers would restore each other's values. The timeout is applied by
+        the caller instead, once, before the pool starts.
+        """
         try:
             host, _, _ = socket.gethostbyaddr(ip)
             return NetworkScannerClient._short_label(host)
         except Exception:
             return None
+
+    @staticmethod
+    def _resolve_hostnames(ips: list[str]) -> dict[str, str | None]:
+        """Reverse-DNS a batch of IPs concurrently. Never raises."""
+        if not ips:
+            return {}
+
+        old_to = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(RDNS_TIMEOUT)
+        try:
+            workers = min(RDNS_MAX_WORKERS, len(ips))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                return dict(zip(ips, pool.map(NetworkScannerClient._fast_rdns, ips)))
+        except Exception as err:
+            _LOGGER.debug("Reverse-DNS batch failed: %s", err)
+            return {}
         finally:
             socket.setdefaulttimeout(old_to)
 
@@ -108,10 +140,6 @@ class NetworkScannerClient:
                             raw_hostname = n
                             break
 
-                hostname = self._short_label(raw_hostname)
-                if not hostname:
-                    hostname = self._fast_rdns(ip, timeout=0.3)
-
                 device_name, device_type = self._get_device_info_from_mac(mac)
                 devices.append(
                     {
@@ -120,12 +148,21 @@ class NetworkScannerClient:
                         "name": device_name,
                         "type": device_type,
                         "vendor": vendor,
-                        "hostname": hostname,
+                        "hostname": self._short_label(raw_hostname),
                     }
                 )
             except Exception as err:
                 _LOGGER.debug("Error parsing host %s: %s", host, err)
                 continue
+
+        # Fill in the hostnames nmap could not supply (-n suppresses its own
+        # lookups) with one concurrent reverse-DNS pass over just those hosts.
+        unresolved = [d["ip"] for d in devices if not d["hostname"]]
+        if unresolved:
+            resolved = self._resolve_hostnames(unresolved)
+            for device in devices:
+                if not device["hostname"]:
+                    device["hostname"] = resolved.get(device["ip"])
 
         try:
             devices.sort(key=lambda x: [int(num) for num in x["ip"].split(".")])
